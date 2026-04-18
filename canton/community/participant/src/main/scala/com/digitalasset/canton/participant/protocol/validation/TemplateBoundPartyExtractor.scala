@@ -6,6 +6,7 @@ package com.digitalasset.canton.participant.protocol.validation
 import com.digitalasset.canton.LfPartyId
 import com.digitalasset.canton.data.{ActionDescription, FullTransactionViewTree}
 import com.digitalasset.canton.discard.Implicits.*
+import com.digitalasset.canton.protocol.CreatedContract
 
 /** Extracts per-party template IDs from a parsed transaction request.
   *
@@ -28,43 +29,45 @@ object TemplateBoundPartyExtractor {
 
     rootViewTrees.foreach { viewTree =>
       val vpd = viewTree.viewParticipantData
-      vpd.actionDescription match {
-        case exercise: ActionDescription.ExerciseActionDescription =>
-          val templateIdStr = exercise.templateId.toString
-          // actors are the parties exercising the choice
-          exercise.actors.foreach { party =>
+      processAction(vpd.actionDescription, vpd.createdCore, builder)
+    }
+
+    builder.toMap
+  }
+
+  /** Process a single action description and accumulate party-to-template mappings.
+    * Extracted as a separate method for testability without FullTransactionViewTree.
+    */
+  private[validation] def processAction(
+      actionDescription: ActionDescription,
+      createdCore: Seq[CreatedContract],
+      builder: scala.collection.mutable.Map[LfPartyId, Set[String]],
+  ): Unit =
+    actionDescription match {
+      case exercise: ActionDescription.ExerciseActionDescription =>
+        val templateIdStr = exercise.templateId.toString
+        exercise.actors.foreach { party =>
+          builder.updateWith(party) {
+            case Some(existing) => Some(existing + templateIdStr)
+            case None => Some(Set(templateIdStr))
+          }.discard
+        }
+
+      case _: ActionDescription.CreateActionDescription =>
+        createdCore.foreach { created =>
+          val templateIdStr = created.contract.templateId.toString
+          created.contract.signatories.foreach { party =>
             builder.updateWith(party) {
               case Some(existing) => Some(existing + templateIdStr)
               case None => Some(Set(templateIdStr))
             }.discard
           }
+        }
 
-        case _: ActionDescription.CreateActionDescription =>
-          // Create actions: the signatories are determined by the contract,
-          // which is in the created contracts list. For template-bound party
-          // validation, we care about creates because the party becomes a
-          // signatory. Extract from the created core contracts.
-          vpd.createdCore.foreach { created =>
-            val templateIdStr = created.contract.templateId.toString
-            created.contract.signatories.foreach { party =>
-              builder.updateWith(party) {
-                case Some(existing) => Some(existing + templateIdStr)
-                case None => Some(Set(templateIdStr))
-              }.discard
-            }
-          }
+      case _: ActionDescription.FetchActionDescription =>
+        ()
 
-        case _: ActionDescription.FetchActionDescription =>
-          // Fetch actions don't create or exercise — no template-bound party
-          // constraint check needed (fetching is read-only).
-          ()
-
-        case _: ActionDescription.LookupByKeyActionDescription =>
-          // LookupByKey is read-only — no template-bound constraint needed.
-          ()
-      }
+      case _: ActionDescription.LookupByKeyActionDescription =>
+        ()
     }
-
-    builder.toMap
-  }
 }

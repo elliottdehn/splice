@@ -3,17 +3,24 @@
 
 package com.digitalasset.canton.participant.protocol.validation
 
+import com.digitalasset.canton.data.ActionDescription
+import com.digitalasset.canton.protocol.DummySerializationVersion
+import com.digitalasset.daml.lf.crypto.Hash
+import com.digitalasset.daml.lf.data.Ref
+import com.digitalasset.daml.lf.transaction.Versioned
+import com.digitalasset.daml.lf.value.Value
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.wordspec.AnyWordSpec
 
-/** Tests for TemplateBoundPartyExtractor.
-  *
-  * Note: constructing FullTransactionViewTree instances requires deep Canton
-  * infrastructure (Merkle trees, salts, crypto). These tests verify the
-  * extraction logic conceptually. Full integration tests with real view trees
-  * would run as part of the integration test suite.
-  */
 class TemplateBoundPartyExtractorTest extends AnyWordSpec with Matchers {
+
+  private val party1 = Ref.Party.assertFromString("party1")
+  private val party2 = Ref.Party.assertFromString("party2")
+  private val contractId = Value.ContractId.V1(Hash.hashPrivateKey("test-contract"))
+  private val seed = Hash.hashPrivateKey("test-seed")
+  private val templateId = Ref.Identifier.assertFromString("pkg:Mod:Template")
+  private val templateId2 = Ref.Identifier.assertFromString("pkg:Mod:Template2")
+  private val version = DummySerializationVersion
 
   "TemplateBoundPartyExtractor" should {
 
@@ -22,37 +29,77 @@ class TemplateBoundPartyExtractorTest extends AnyWordSpec with Matchers {
       result shouldBe empty
     }
 
-    "handle all ActionDescription variants without match errors" in {
-      // This test verifies that the match in extractTemplateIdsByParty
-      // covers all ActionDescription subtypes:
-      //   - CreateActionDescription ✓
-      //   - ExerciseActionDescription ✓
-      //   - FetchActionDescription ✓
-      //   - LookupByKeyActionDescription ✓
-      //
-      // Without the LookupByKeyActionDescription case, a MatchError would
-      // occur at runtime for transactions containing lookupByKey nodes.
-      //
-      // Full coverage requires constructing real view trees, which is
-      // tested in the integration test suite.
-      succeed
+    "extract actors from exercise actions" in {
+      val builder = scala.collection.mutable.Map.empty[com.digitalasset.canton.LfPartyId, Set[String]]
+      val exercise = ActionDescription.ExerciseActionDescription.tryCreate(
+        inputContractId = contractId,
+        templateId = templateId,
+        choice = Ref.ChoiceName.assertFromString("Swap"),
+        interfaceId = None,
+        packagePreference = Set.empty,
+        chosenValue = Versioned(version, Value.ValueUnit),
+        actors = Set(party1, party2),
+        byKey = false,
+        seed = seed,
+        failed = false,
+      )
+
+      TemplateBoundPartyExtractor.processAction(exercise, Seq.empty, builder)
+
+      builder.toMap shouldBe Map(
+        party1 -> Set(templateId.toString),
+        party2 -> Set(templateId.toString),
+      )
     }
 
-    "the extractor checks root actions only (security invariant)" in {
-      // The extractor traverses rootViewTrees and checks actionDescription
-      // (the root action of each view). Sub-actions within a choice body
-      // are NOT checked — they inherit authority from the root action via
-      // Daml's authorization model.
-      //
-      // This is critical for security: a template-bound AMM party with
-      // allowedTemplates = Set("AMMPool") can exercise Token.Transfer
-      // WITHIN an AMMPool.Swap choice body (inherited authority), but
-      // cannot exercise Token.Transfer as a root action (rejected).
-      //
-      // The extractor only sees root actions because it only looks at
-      // viewTree.viewParticipantData.actionDescription, which is the
-      // root action per view tree.
-      succeed
+    "fetch action produces no mappings (read-only)" in {
+      val builder = scala.collection.mutable.Map.empty[com.digitalasset.canton.LfPartyId, Set[String]]
+      val fetch = ActionDescription.FetchActionDescription(
+        inputContractId = contractId,
+        actors = Set(party1),
+        byKey = false,
+        templateId = templateId,
+        interfaceId = None,
+      )
+
+      TemplateBoundPartyExtractor.processAction(fetch, Seq.empty, builder)
+
+      builder.toMap shouldBe empty
+    }
+
+    "accumulate multiple exercises for the same party" in {
+      val builder = scala.collection.mutable.Map.empty[com.digitalasset.canton.LfPartyId, Set[String]]
+
+      val exercise1 = ActionDescription.ExerciseActionDescription.tryCreate(
+        inputContractId = contractId,
+        templateId = templateId,
+        choice = Ref.ChoiceName.assertFromString("Swap"),
+        interfaceId = None,
+        packagePreference = Set.empty,
+        chosenValue = Versioned(version, Value.ValueUnit),
+        actors = Set(party1),
+        byKey = false,
+        seed = seed,
+        failed = false,
+      )
+
+      val exercise2 = ActionDescription.ExerciseActionDescription.tryCreate(
+        inputContractId = contractId,
+        templateId = templateId2,
+        choice = Ref.ChoiceName.assertFromString("Transfer"),
+        interfaceId = None,
+        packagePreference = Set.empty,
+        chosenValue = Versioned(version, Value.ValueUnit),
+        actors = Set(party1),
+        byKey = false,
+        seed = Hash.hashPrivateKey("seed2"),
+        failed = false,
+      )
+
+      TemplateBoundPartyExtractor.processAction(exercise1, Seq.empty, builder)
+      TemplateBoundPartyExtractor.processAction(exercise2, Seq.empty, builder)
+
+      builder(party1) shouldBe Set(templateId.toString, templateId2.toString)
     }
   }
 }
